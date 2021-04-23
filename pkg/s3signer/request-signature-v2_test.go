@@ -22,6 +22,8 @@ import (
 	"testing"
 	"net/url"
 	"net/http"
+	"bytes"
+	"github.com/stretchr/testify/assert"
 )
 
 // Tests for 'func TestResourceListSorting(t *testing.T)'.
@@ -64,7 +66,17 @@ func TestEncodeURL2PathWithVirtualHost(t *testing.T) {
 
 	for index, testResult := range testResults {
 		if !testResult {
-			t.Fatalf("Failed to encode - %s", testCases[index])
+			t.Fatalf("Failed to translate - %s", testCases[index])
 		}
 	}
+}
+
+func TestShouldIngnoreTheSpecifiedHeadersDuringV2Signing(t *testing.T) {
+	buf := new(bytes.Buffer)
+	req := http.Request{}
+	req.Header = http.Header{}
+	req.Header.Add("x-amz-meta-test-header", "test-value")
+	req.Header.Add("x-amz-meta-date", "123")
+	writeCanonicalizedHeaders(buf, &req, map[string]bool {"x-amz-meta-test-header": true})
+	assert.Equal(t, buf.String(), "x-amz-meta-date:123\n")
 }

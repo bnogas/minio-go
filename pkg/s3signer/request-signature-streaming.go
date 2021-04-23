@@ -45,17 +45,25 @@ const (
 // a request.
 var ignoredStreamingHeaders = map[string]bool{
 	"Authorization": true,
-	"User-Agent":    true,
 	"Content-Type":  true,
+	"User-Agent":    true,
 }
 
-// getSignedChunkLength - calculates the length of chunk metadata
-func getSignedChunkLength(chunkDataSize int64) int64 {
+// GetSignedChunkLength - calculates the length of chunk metadata
+func GetSignedChunkLength(chunkDataSize int64) int64 {
 	return int64(len(fmt.Sprintf("%x", chunkDataSize))) +
 		chunkSigConstLen +
 		signatureStrLen +
 		crlfLen +
 		chunkDataSize +
+		crlfLen
+}
+
+// GetChunkSignatureLength - calculates the length of signature in the chunk
+func GetChunkSignatureLength(chunkDataSize int64) int64 {
+	return int64(len(fmt.Sprintf("%x", chunkDataSize))) +
+		chunkSigConstLen +
+		signatureStrLen +
 		crlfLen
 }
 
@@ -68,21 +76,21 @@ func getStreamLength(dataLen, chunkSize int64) int64 {
 	chunksCount := int64(dataLen / chunkSize)
 	remainingBytes := int64(dataLen % chunkSize)
 	streamLen := int64(0)
-	streamLen += chunksCount * getSignedChunkLength(chunkSize)
+	streamLen += chunksCount * GetSignedChunkLength(chunkSize)
 	if remainingBytes > 0 {
-		streamLen += getSignedChunkLength(remainingBytes)
+		streamLen += GetSignedChunkLength(remainingBytes)
 	}
-	streamLen += getSignedChunkLength(0)
+	streamLen += GetSignedChunkLength(0)
 	return streamLen
 }
 
 // buildChunkStringToSign - returns the string to sign given chunk data
 // and previous signature.
-func buildChunkStringToSign(t time.Time, region, previousSig string, chunkData []byte) string {
+func buildChunkStringToSign(t time.Time, region, service, previousSig string, chunkData []byte) string {
 	stringToSignParts := []string{
 		streamingPayloadHdr,
 		t.Format(iso8601DateFormat),
-		getScope(region, t),
+		getScope(region, service, t),
 		previousSig,
 		emptySHA256,
 		hex.EncodeToString(sum256(chunkData)),
@@ -113,24 +121,23 @@ func buildChunkHeader(chunkLen int64, signature string) []byte {
 }
 
 // buildChunkSignature - returns chunk signature for a given chunk and previous signature.
-func buildChunkSignature(chunkData []byte, reqTime time.Time, region,
-	previousSignature, secretAccessKey string) string {
+func buildChunkSignature(chunkData []byte, reqTime time.Time, region, service,
+previousSignature, secretAccessKey string) string {
 
-	chunkStringToSign := buildChunkStringToSign(reqTime, region,
-		previousSignature, chunkData)
-	signingKey := getSigningKey(secretAccessKey, region, reqTime)
+	chunkStringToSign := buildChunkStringToSign(reqTime, region, service, previousSignature, chunkData)
+	signingKey := getSigningKey(secretAccessKey, region, service, reqTime)
 	return getSignature(signingKey, chunkStringToSign)
 }
 
 // getSeedSignature - returns the seed signature for a given request.
-func (s *StreamingReader) setSeedSignature(req *http.Request) {
+func (s *StreamingReader) setSeedSignature(req *http.Request, ignoredHeaders map[string]bool) {
 	// Get canonical request
-	canonicalRequest := getCanonicalRequest(*req, ignoredStreamingHeaders)
+	canonicalRequest := getCanonicalRequest(req, ignoredHeaders)
 
 	// Get string to sign from canonical request.
-	stringToSign := getStringToSignV4(s.reqTime, s.region, canonicalRequest)
+	stringToSign := getStringToSignV4(s.reqTime, s.region, s.service, canonicalRequest)
 
-	signingKey := getSigningKey(s.secretAccessKey, s.region, s.reqTime)
+	signingKey := getSigningKey(s.secretAccessKey, s.region, s.service, s.reqTime)
 
 	// Calculate signature.
 	s.seedSignature = getSignature(signingKey, stringToSign)
@@ -145,6 +152,7 @@ type StreamingReader struct {
 	region          string
 	prevSignature   string
 	seedSignature   string
+	service         string
 	contentLen      int64         // Content-Length from req header
 	baseReadCloser  io.ReadCloser // underlying io.Reader
 	bytesRead       int64         // bytes read from underlying io.Reader
@@ -156,13 +164,14 @@ type StreamingReader struct {
 	chunkNum        int
 	totalChunks     int
 	lastChunkSize   int
+	isProxying      bool
 }
 
 // signChunk - signs a chunk read from s.baseReader of chunkLen size.
 func (s *StreamingReader) signChunk(chunkLen int) {
 	// Compute chunk signature for next header
 	signature := buildChunkSignature(s.chunkBuf[:chunkLen], s.reqTime,
-		s.region, s.prevSignature, s.secretAccessKey)
+		s.region, s.service, s.prevSignature, s.secretAccessKey)
 
 	// For next chunk signature computation
 	s.prevSignature = signature
@@ -184,11 +193,11 @@ func (s *StreamingReader) signChunk(chunkLen int) {
 
 // setStreamingAuthHeader - builds and sets authorization header value
 // for streaming signature.
-func (s *StreamingReader) setStreamingAuthHeader(req *http.Request) {
-	credential := GetCredential(s.accessKeyID, s.region, s.reqTime)
+func (s *StreamingReader) setStreamingAuthHeader(req *http.Request, ignoredHeaders map[string]bool) {
+	credential := GetCredential(s.accessKeyID, s.region, s.service, s.reqTime)
 	authParts := []string{
 		signV4Algorithm + " Credential=" + credential,
-		"SignedHeaders=" + getSignedHeaders(*req, ignoredStreamingHeaders),
+		"SignedHeaders=" + getSignedHeaders(req, ignoredHeaders),
 		"Signature=" + s.seedSignature,
 	}
 
@@ -199,8 +208,8 @@ func (s *StreamingReader) setStreamingAuthHeader(req *http.Request) {
 
 // StreamingSignV4 - provides chunked upload signatureV4 support by
 // implementing io.Reader.
-func StreamingSignV4(req *http.Request, accessKeyID, secretAccessKey, sessionToken,
-	region string, dataLen int64, reqTime time.Time) *http.Request {
+func StreamingSignV4WithIgnoredHeaders(req *http.Request, accessKeyID, secretAccessKey, sessionToken,
+region, service string, dataLen int64, reqTime time.Time, ignoredHeaders map[string]bool, isProxying bool) *http.Request {
 
 	// Set headers needed for streaming signature.
 	prepareStreamingRequest(req, sessionToken, dataLen, reqTime)
@@ -215,21 +224,23 @@ func StreamingSignV4(req *http.Request, accessKeyID, secretAccessKey, sessionTok
 		secretAccessKey: secretAccessKey,
 		sessionToken:    sessionToken,
 		region:          region,
+		service:         service,
 		reqTime:         reqTime,
 		chunkBuf:        make([]byte, payloadChunkSize),
 		contentLen:      dataLen,
 		chunkNum:        1,
 		totalChunks:     int((dataLen+payloadChunkSize-1)/payloadChunkSize) + 1,
 		lastChunkSize:   int(dataLen % payloadChunkSize),
+		isProxying:      isProxying,
 	}
 
 	// Add the request headers required for chunk upload signing.
 
 	// Compute the seed signature.
-	stReader.setSeedSignature(req)
+	stReader.setSeedSignature(req, ignoredHeaders)
 
 	// Set the authorization header with the seed signature.
-	stReader.setStreamingAuthHeader(req)
+	stReader.setStreamingAuthHeader(req, ignoredHeaders)
 
 	// Set seed signature as prevSignature for subsequent
 	// streaming signing process.
@@ -237,6 +248,13 @@ func StreamingSignV4(req *http.Request, accessKeyID, secretAccessKey, sessionTok
 	req.Body = stReader
 
 	return req
+}
+
+func StreamingSignV4(req *http.Request, accessKeyID, secretAccessKey, sessionToken,
+region, service string, dataLen int64, reqTime time.Time, isProxying bool) *http.Request {
+	return StreamingSignV4WithIgnoredHeaders(
+		req, accessKeyID, secretAccessKey, sessionToken,
+		region, service, dataLen, reqTime, ignoredStreamingHeaders, isProxying)
 }
 
 // Read - this method performs chunk upload signature providing a
@@ -247,12 +265,41 @@ func (s *StreamingReader) Read(buf []byte) (int, error) {
 	// never re-fill s.buf.
 	case s.done:
 
-	// s.buf will be (re-)filled with next chunk when has lesser
-	// bytes than asked for.
+		// s.buf will be (re-)filled with next chunk when has lesser
+		// bytes than asked for.
 	case s.buf.Len() < len(buf):
 		s.chunkBufLen = 0
+		bytesLeft := 0
 		for {
-			n1, err := s.baseReadCloser.Read(s.chunkBuf[s.chunkBufLen:])
+
+			chunkSize := payloadChunkSize
+			n1 := 0
+			var err error
+
+			if s.isProxying {
+
+				var chunkLength int
+				if bytesLeft > 0 {
+					chunkLength = bytesLeft
+					bytesLeft = 0
+				} else {
+					chunkLength, err = s.discardNextSignature()
+					if err != nil {
+						return 0, err
+					}
+				}
+
+				if chunkLength > payloadChunkSize {
+					bytesLeft = chunkLength - payloadChunkSize
+					chunkLength = payloadChunkSize
+				}
+
+				chunkSize = int(chunkLength)
+				n1, err = s.baseReadCloser.Read(s.chunkBuf[:chunkSize])
+			} else {
+				n1, err = s.baseReadCloser.Read(s.chunkBuf[s.chunkBufLen:])
+			}
+
 			// Usually we validate `err` first, but in this case
 			// we are validating n > 0 for the following reasons.
 			//
@@ -268,9 +315,9 @@ func (s *StreamingReader) Read(buf []byte) (int, error) {
 				s.chunkBufLen += n1
 				s.bytesRead += int64(n1)
 
-				if s.chunkBufLen == payloadChunkSize ||
+				if (s.chunkBufLen == payloadChunkSize ||
 					(s.chunkNum == s.totalChunks-1 &&
-						s.chunkBufLen == s.lastChunkSize) {
+						s.chunkBufLen == s.lastChunkSize)) && !s.isProxying {
 					// Sign the chunk and write it to s.buf.
 					s.signChunk(s.chunkBufLen)
 					break
@@ -294,13 +341,67 @@ func (s *StreamingReader) Read(buf []byte) (int, error) {
 				}
 				return 0, err
 			}
-
+			if s.isProxying {
+				s.signChunk(chunkSize)
+				if chunkSize == 0 {
+					s.done = true
+					break
+				}
+				_, err = io.CopyN(ioutil.Discard, s.baseReadCloser, crlfLen)
+				if err != nil {
+					return -1, err
+				}
+			}
+		}
+	}
+	if s.isProxying {
+		_, err := s.discardNextSignature()
+		if err != nil {
+			return 0, err
 		}
 	}
 	return s.buf.Read(buf)
 }
 
+func extractNextChunkLength(buffer io.Reader) (int, int, error) {
+	currentCharacter := make([]byte, 1)
+	var chunkSizeInHex strings.Builder
+
+	for {
+
+		nRead, err := buffer.Read(currentCharacter)
+		if nRead != 1 || err != nil {
+			return 0, 0, fmt.Errorf("failed to read next character: %s", err)
+		}
+
+		if string(currentCharacter) == ";" {
+			break
+		}
+
+		chunkSizeInHex.Write(currentCharacter)
+	}
+
+	inHex := strings.TrimSpace(chunkSizeInHex.String())
+	size, _ := strconv.ParseUint(inHex, 16, 64)
+	return int(size), chunkSizeInHex.Len(), nil
+}
+
 // Close - this method makes underlying io.ReadCloser's Close method available.
 func (s *StreamingReader) Close() error {
 	return s.baseReadCloser.Close()
+}
+
+func (s *StreamingReader) discardNextSignature() (int, error) {
+	nextChunkLength, numOfCharsRead, err := extractNextChunkLength(s.baseReadCloser)
+	if nextChunkLength == 0 {
+		return 0, nil
+	}
+	if err != nil {
+		return -1, err
+	}
+	_, err = io.CopyN(ioutil.Discard, s.baseReadCloser, GetChunkSignatureLength(int64(nextChunkLength))-int64(1)-int64(numOfCharsRead))
+	if err != nil {
+		return -1, err
+	}
+	return int(nextChunkLength), nil
 }
